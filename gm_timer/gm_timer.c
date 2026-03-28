@@ -17,25 +17,17 @@
 
 #include "gm_timer.h"
 
-// 定时器状态
-typedef enum gm_timer_status
-{
-    E_GM_TIMER_STATUS_CREATED = 1,     // 已创建
-    E_GM_TIMER_STATUS_RUNNING,         // 运行中
-    E_GM_TIMER_STATUS_PAUSED,          // 已暂停
-    E_GM_TIMER_STATUS_REQUEST_DESTROY, // 请求销毁
-} gm_timer_status_e;
-
 // 定时器对象
-struct _gm_timer
+struct _gm_timer_t
 {
-    timer_t timer_id;         // 定时器ID
-    pthread_mutex_t mutex;    // 互斥锁
-    gm_timer_status_e status; // 定时器状态
-    gm_timer_cb timer_cb;     // 定时器回调函数
-    uint32_t repeat_count;    // 定时器重复次数 (1: 执行一次; UINT32_MAX: 无限循环)
-    uint32_t timeout_ms;      // 定时器超时时间 (单位: ms)
-    const void *user_data;    // 用户数据
+    timer_t timer_id;           // 定时器 ID
+    pthread_mutex_t mutex;      // 互斥锁
+    gm_timer_status_e status;   // 定时器状态
+    gm_timer_cb timer_cb;       // 定时器回调函数
+    uint32_t repeat_count;      // 定时器重复次数 (0: 已停止; 1: 执行一次; UINT32_MAX: 无限循环)
+    uint32_t repeat_count_init; // 定时器初始重复次数 (用于重启定时器时，恢复初始值)
+    uint32_t timeout_ms;        // 定时器超时时间 (单位: ms)
+    const void *user_data;      // 用户数据
 };
 
 /**
@@ -105,8 +97,8 @@ static void gm_timer_thread(union sigval sigev_value)
 
     pthread_mutex_lock(&gm_timer->mutex);
 
-    // 已请求销毁，则销毁定时器
-    if (gm_timer->status == E_GM_TIMER_STATUS_REQUEST_DESTROY)
+    // 已请求销毁，立即销毁
+    if (gm_timer->status == E_GM_TIMER_STATUS_DESTROYING)
     {
         timer_delete(gm_timer->timer_id);
         pthread_mutex_unlock(&gm_timer->mutex);
@@ -116,14 +108,23 @@ static void gm_timer_thread(union sigval sigev_value)
         return;
     }
 
+    // 已暂停/已停止的定时器，不执行回调函数
+    if ((gm_timer->status == E_GM_TIMER_STATUS_PAUSED) || (gm_timer->status == E_GM_TIMER_STATUS_STOPPED))
+    {
+        pthread_mutex_unlock(&gm_timer->mutex);
+
+        return;
+    }
+
     // 先把 repeat_count 减一，防止回调函数会根据该值判断是否是最后一次运行或者是否需要销毁定时器
-    if ((gm_timer->repeat_count > 0) && (gm_timer->repeat_count < UINT32_MAX))
+    if ((gm_timer->repeat_count > 0) && (gm_timer->repeat_count < GM_TIMER_REPEAT_FOREVER))
     {
         gm_timer->repeat_count--;
 
+        // 重复次数已用完，设置定时器状态为已停止
         if (gm_timer->repeat_count == 0)
         {
-            gm_timer->status = E_GM_TIMER_STATUS_REQUEST_DESTROY;
+            gm_timer->status = E_GM_TIMER_STATUS_STOPPED;
         }
     }
     pthread_mutex_unlock(&gm_timer->mutex);
@@ -134,9 +135,9 @@ static void gm_timer_thread(union sigval sigev_value)
         gm_timer->timer_cb(gm_timer);
     }
 
-    // 在回调函数中请求了销毁定时器或重复次数归0，立即销毁，万一超时时间很长，销毁速度太慢了
+    // 在回调函数中请求了销毁定时器，立即销毁
     pthread_mutex_lock(&gm_timer->mutex);
-    if ((gm_timer->status == E_GM_TIMER_STATUS_REQUEST_DESTROY) || (gm_timer->repeat_count == 0))
+    if ((gm_timer->status == E_GM_TIMER_STATUS_DESTROYING))
     {
         timer_delete(gm_timer->timer_id);
         pthread_mutex_unlock(&gm_timer->mutex);
@@ -173,7 +174,8 @@ gm_timer_t *gm_timer_create(void)
 
     gm_timer->status = E_GM_TIMER_STATUS_CREATED;
     gm_timer->timer_cb = NULL;
-    gm_timer->repeat_count = -1;
+    gm_timer->repeat_count = GM_TIMER_REPEAT_FOREVER;
+    gm_timer->repeat_count_init = GM_TIMER_REPEAT_FOREVER;
     gm_timer->timeout_ms = 0;
     gm_timer->user_data = NULL;
     pthread_mutex_init(&gm_timer->mutex, NULL);
@@ -198,7 +200,6 @@ int gm_timer_init(gm_timer_t *gm_timer, const gm_timer_cb timer_cb, const uint32
     }
 
     struct sigevent sig_event = {0};
-    memset(&sig_event, 0, sizeof(struct sigevent));
     sig_event.sigev_notify = SIGEV_THREAD;
     sig_event.sigev_notify_function = gm_timer_thread;
     sig_event.sigev_value.sival_ptr = gm_timer;
@@ -207,7 +208,7 @@ int gm_timer_init(gm_timer_t *gm_timer, const gm_timer_cb timer_cb, const uint32
     {
         pthread_mutex_unlock(&gm_timer->mutex);
 
-        return -3;
+        return -2;
     }
 
     struct itimerspec timer_spec = {0};
@@ -216,7 +217,7 @@ int gm_timer_init(gm_timer_t *gm_timer, const gm_timer_cb timer_cb, const uint32
         timer_delete(gm_timer->timer_id);
         pthread_mutex_unlock(&gm_timer->mutex);
 
-        return -4;
+        return -3;
     }
 
     if (timer_settime(gm_timer->timer_id, 0, &timer_spec, NULL) == -1)
@@ -224,12 +225,13 @@ int gm_timer_init(gm_timer_t *gm_timer, const gm_timer_cb timer_cb, const uint32
         timer_delete(gm_timer->timer_id);
         pthread_mutex_unlock(&gm_timer->mutex);
 
-        return -5;
+        return -4;
     }
 
     gm_timer->status = E_GM_TIMER_STATUS_RUNNING;
     gm_timer->timer_cb = timer_cb;
     gm_timer->repeat_count = repeat_count;
+    gm_timer->repeat_count_init = repeat_count;
     gm_timer->timeout_ms = timeout_ms;
     gm_timer->user_data = user_data;
 
@@ -249,7 +251,7 @@ int gm_timer_destroy(gm_timer_t *gm_timer)
 
     switch (gm_timer->status)
     {
-    // 未初始化，立即销毁
+    // 未初始化，立即销毁(无需销毁 timer_id，因为还未调用 gm_timer_init() 创建)
     case E_GM_TIMER_STATUS_CREATED:
     {
         pthread_mutex_unlock(&gm_timer->mutex);
@@ -259,17 +261,18 @@ int gm_timer_destroy(gm_timer_t *gm_timer)
         return 0;
     }
 
-    // 运行中，异步销毁
+    // 运行中，异步销毁(等待在回调函数中销毁)
     case E_GM_TIMER_STATUS_RUNNING:
     {
-        gm_timer->status = E_GM_TIMER_STATUS_REQUEST_DESTROY;
+        gm_timer->status = E_GM_TIMER_STATUS_DESTROYING;
         pthread_mutex_unlock(&gm_timer->mutex);
 
-        return 0;
+        return 1;
     }
 
-    // 暂停中，立即销毁
+    // 已暂停/已停止，立即销毁
     case E_GM_TIMER_STATUS_PAUSED:
+    case E_GM_TIMER_STATUS_STOPPED:
     {
         timer_delete(gm_timer->timer_id);
         pthread_mutex_unlock(&gm_timer->mutex);
@@ -280,11 +283,11 @@ int gm_timer_destroy(gm_timer_t *gm_timer)
     }
 
     // 销毁中，忽略
-    case E_GM_TIMER_STATUS_REQUEST_DESTROY:
+    case E_GM_TIMER_STATUS_DESTROYING:
     {
         pthread_mutex_unlock(&gm_timer->mutex);
 
-        return 0;
+        return 1;
     }
 
     default:
@@ -333,6 +336,7 @@ int gm_timer_set_repeat_count(gm_timer_t *gm_timer, const uint32_t repeat_count)
     }
 
     gm_timer->repeat_count = repeat_count;
+    gm_timer->repeat_count_init = repeat_count;
     pthread_mutex_unlock(&gm_timer->mutex);
 
     return 0;
@@ -395,15 +399,39 @@ int gm_timer_set_user_data(gm_timer_t *gm_timer, const void *user_data)
     return 0;
 }
 
-int gm_timer_get_repeat_count(gm_timer_t *gm_timer, uint32_t *repeat_count)
+int gm_timer_get_remaining_repeat_count(gm_timer_t *gm_timer, uint32_t *repeat_count)
 {
     if (gm_timer == NULL)
     {
         return -1;
     }
 
+    if (repeat_count == NULL)
+    {
+        return -2;
+    }
+
     pthread_mutex_lock(&gm_timer->mutex);
     *repeat_count = gm_timer->repeat_count;
+    pthread_mutex_unlock(&gm_timer->mutex);
+
+    return 0;
+}
+
+int gm_timer_get_init_repeat_count(gm_timer_t *gm_timer, uint32_t *repeat_count)
+{
+    if (gm_timer == NULL)
+    {
+        return -1;
+    }
+
+    if (repeat_count == NULL)
+    {
+        return -2;
+    }
+
+    pthread_mutex_lock(&gm_timer->mutex);
+    *repeat_count = gm_timer->repeat_count_init;
     pthread_mutex_unlock(&gm_timer->mutex);
 
     return 0;
@@ -414,6 +442,11 @@ int gm_timer_get_timeout(gm_timer_t *gm_timer, uint32_t *timeout_ms)
     if (gm_timer == NULL)
     {
         return -1;
+    }
+
+    if (timeout_ms == NULL)
+    {
+        return -2;
     }
 
     pthread_mutex_lock(&gm_timer->mutex);
@@ -479,7 +512,16 @@ int gm_timer_pause(gm_timer_t *gm_timer)
     }
 
     pthread_mutex_lock(&gm_timer->mutex);
-    if ((gm_timer->status != E_GM_TIMER_STATUS_RUNNING) && (gm_timer->status != E_GM_TIMER_STATUS_PAUSED))
+    // 已暂停的定时器，无需再暂停
+    if (gm_timer->status == E_GM_TIMER_STATUS_PAUSED)
+    {
+        pthread_mutex_unlock(&gm_timer->mutex);
+
+        return 0;
+    }
+
+    // 其它状态仅运行中的定时器可以暂停
+    if (gm_timer->status != E_GM_TIMER_STATUS_RUNNING)
     {
         pthread_mutex_unlock(&gm_timer->mutex);
 
@@ -508,6 +550,13 @@ int gm_timer_resume(gm_timer_t *gm_timer)
     }
 
     pthread_mutex_lock(&gm_timer->mutex);
+    if (gm_timer->status == E_GM_TIMER_STATUS_RUNNING)
+    {
+        pthread_mutex_unlock(&gm_timer->mutex);
+
+        return 0;
+    }
+
     if (gm_timer->status != E_GM_TIMER_STATUS_PAUSED)
     {
         pthread_mutex_unlock(&gm_timer->mutex);
@@ -536,16 +585,111 @@ int gm_timer_resume(gm_timer_t *gm_timer)
     return 0;
 }
 
-bool gm_timer_is_paused(gm_timer_t *gm_timer)
+int gm_timer_stop(gm_timer_t *gm_timer)
 {
     if (gm_timer == NULL)
     {
-        return false;
+        return -1;
     }
 
     pthread_mutex_lock(&gm_timer->mutex);
-    bool is_paused = (gm_timer->status == E_GM_TIMER_STATUS_PAUSED);
+    if (gm_timer->status == E_GM_TIMER_STATUS_STOPPED)
+    {
+        pthread_mutex_unlock(&gm_timer->mutex);
+
+        return 0;
+    }
+
+    if ((gm_timer->status != E_GM_TIMER_STATUS_RUNNING) && (gm_timer->status != E_GM_TIMER_STATUS_PAUSED))
+    {
+        pthread_mutex_unlock(&gm_timer->mutex);
+
+        return -2;
+    }
+
+    struct itimerspec timer_spec = {0};
+    if (timer_settime(gm_timer->timer_id, 0, &timer_spec, NULL) == -1)
+    {
+        pthread_mutex_unlock(&gm_timer->mutex);
+
+        return -3;
+    }
+
+    gm_timer->status = E_GM_TIMER_STATUS_STOPPED;
+    gm_timer->repeat_count = 0;
     pthread_mutex_unlock(&gm_timer->mutex);
 
-    return is_paused;
+    return 0;
+}
+
+int gm_timer_restart(gm_timer_t *gm_timer)
+{
+    if (gm_timer == NULL)
+    {
+        return -1;
+    }
+
+    pthread_mutex_lock(&gm_timer->mutex);
+    if ((gm_timer->status != E_GM_TIMER_STATUS_RUNNING) && (gm_timer->status != E_GM_TIMER_STATUS_PAUSED) &&
+        (gm_timer->status != E_GM_TIMER_STATUS_STOPPED))
+    {
+        pthread_mutex_unlock(&gm_timer->mutex);
+
+        return -2;
+    }
+
+    struct itimerspec timer_spec = {0};
+    if (gm_timer_ms_to_timespec_one_shot(gm_timer->timeout_ms, &timer_spec) != 0)
+    {
+        pthread_mutex_unlock(&gm_timer->mutex);
+
+        return -3;
+    }
+
+    if (timer_settime(gm_timer->timer_id, 0, &timer_spec, NULL) == -1)
+    {
+        pthread_mutex_unlock(&gm_timer->mutex);
+
+        return -4;
+    }
+
+    gm_timer->status = E_GM_TIMER_STATUS_RUNNING;
+    gm_timer->repeat_count = gm_timer->repeat_count_init;
+    pthread_mutex_unlock(&gm_timer->mutex);
+
+    return 0;
+}
+
+gm_timer_status_e gm_timer_get_status(gm_timer_t *gm_timer)
+{
+    if (gm_timer == NULL)
+    {
+        return E_GM_TIMER_STATUS_NONE;
+    }
+
+    pthread_mutex_lock(&gm_timer->mutex);
+    gm_timer_status_e status = gm_timer->status;
+    pthread_mutex_unlock(&gm_timer->mutex);
+
+    return status;
+}
+
+bool gm_timer_is_created(gm_timer_t *gm_timer)
+{
+    return (gm_timer_get_status(gm_timer) == E_GM_TIMER_STATUS_CREATED);
+}
+
+bool gm_timer_is_running(gm_timer_t *gm_timer)
+{
+    return (gm_timer_get_status(gm_timer) == E_GM_TIMER_STATUS_RUNNING);
+}
+
+bool gm_timer_is_paused(gm_timer_t *gm_timer)
+{
+    return (gm_timer_get_status(gm_timer) == E_GM_TIMER_STATUS_PAUSED);
+}
+
+bool gm_timer_is_stopped(gm_timer_t *gm_timer)
+{
+    return (gm_timer_get_status(gm_timer) == E_GM_TIMER_STATUS_STOPPED);
 }
